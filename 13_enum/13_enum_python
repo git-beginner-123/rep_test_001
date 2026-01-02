@@ -1,0 +1,173 @@
+
+
+import time
+import serial
+from enum import IntEnum, IntFlag
+from serial.tools import list_ports
+
+SOF = 0xAA
+EOF_MARK = 0x55
+
+class FrameFlags(IntFlag):
+    ACK_REQ = 1 << 0
+    IS_ACK  = 1 << 1
+    IS_NACK = 1 << 2
+    HAS_TLV = 1 << 3
+
+class FrameType(IntEnum):
+    TYPE_CMD = 0x01
+    TYPE_RSP = 0x02
+
+class TlvTag(IntEnum):
+    TAG_TEXT  = 0x02
+    TAG_ERROR = 0x7F
+
+def crc8_xor(data: bytes) -> int:
+    c = 0
+    for b in data:
+        c ^= b
+    return c & 0xFF
+
+def build_frame(flags: int, ftype: int, seq: int, payload: bytes) -> bytes:
+    if len(payload) > 96:
+        raise ValueError("payload too long")
+    header = bytes([SOF, flags & 0xFF, ftype & 0xFF, seq & 0xFF, len(payload) & 0xFF])
+    crc = crc8_xor(bytes([flags & 0xFF, ftype & 0xFF, seq & 0xFF, len(payload) & 0xFF]) + payload)
+    return header + payload + bytes([crc, EOF_MARK])
+
+def read_exact(ser: serial.Serial, n: int, deadline: float) -> bytes:
+    buf = bytearray()
+    while len(buf) < n and time.time() < deadline:
+        chunk = ser.read(n - len(buf))
+        if chunk:
+            buf.extend(chunk)
+    return bytes(buf)
+
+def read_frame(ser: serial.Serial, timeout_s: float = 0.5):
+    deadline = time.time() + timeout_s
+
+    while time.time() < deadline:
+        b = ser.read(1)
+        if not b:
+            continue
+        if b[0] == SOF:
+            break
+    else:
+        return None
+
+    rest = read_exact(ser, 4, deadline)  # flags,type,seq,len
+    if len(rest) != 4:
+        return None
+
+    flags, ftype, seq, ln = rest[0], rest[1], rest[2], rest[3]
+    payload = read_exact(ser, ln, deadline)
+    crc = read_exact(ser, 1, deadline)
+    eof = read_exact(ser, 1, deadline)
+
+    if len(payload) != ln or len(crc) != 1 or len(eof) != 1:
+        return None
+    if eof[0] != EOF_MARK:
+        return None
+
+    expect = crc8_xor(bytes([flags, ftype, seq, ln]) + payload)
+    if crc[0] != expect:
+        return None
+
+    return flags, ftype, seq, payload
+
+def tlv(tag: int, value: bytes) -> bytes:
+    if len(value) > 255:
+        raise ValueError("tlv too long")
+    return bytes([tag & 0xFF, len(value) & 0xFF]) + value
+
+def parse_tlvs(payload: bytes):
+    out = []
+    i = 0
+    while i + 2 <= len(payload):
+        tag = payload[i]
+        ln = payload[i + 1]
+        i += 2
+        if i + ln > len(payload):
+            break
+        out.append((tag, payload[i:i+ln]))
+        i += ln
+    return out
+
+def pick_port():
+    for p in list_ports.comports():
+        desc = (p.description or "").lower()
+        if "usb" in desc or "serial" in desc or "cp210" in desc or "ch340" in desc or "usbmodem" in desc:
+            return p.device
+    return None
+
+class Link:
+    def __init__(self, ser: serial.Serial):
+        self.ser = ser
+        self.seq = 0
+
+    def next_seq(self) -> int:
+        self.seq = (self.seq + 1) & 0xFF
+        if self.seq == 0:
+            self.seq = 1
+        return self.seq
+
+    def request(self, payload_tlv: bytes, retries: int = 3, timeout_s: float = 0.6):
+        seq = self.next_seq()
+        req = build_frame(int(FrameFlags.ACK_REQ | FrameFlags.HAS_TLV), int(FrameType.TYPE_CMD), seq, payload_tlv)
+
+        for _ in range(retries):
+            self.ser.write(req)
+
+            got_rsp = None
+            deadline = time.time() + timeout_s
+            while time.time() < deadline:
+                fr = read_frame(self.ser, timeout_s=0.2)
+                if not fr:
+                    continue
+                flags, ftype, rseq, payload = fr
+                if rseq != seq:
+                    continue
+
+                if flags & int(FrameFlags.IS_ACK):
+                    continue
+                if flags & int(FrameFlags.IS_NACK):
+                    return ("NACK", payload)
+                if ftype == int(FrameType.TYPE_RSP):
+                    got_rsp = payload
+                    break
+
+            if got_rsp is not None:
+                return ("OK", got_rsp)
+
+        return ("TIMEOUT", b"")
+
+def send_command(link: Link, cmd: str):
+    payload = tlv(int(TlvTag.TAG_TEXT), cmd.encode("ascii", errors="ignore"))
+    st, rsp = link.request(payload)
+    if st != "OK":
+        print(cmd, "=>", st)
+        return
+
+    text = None
+    for tag, val in parse_tlvs(rsp):
+        if tag == int(TlvTag.TAG_TEXT):
+            text = val.decode(errors="replace")
+    print(cmd, "=>", text if text is not None else "NO_TEXT")
+
+def main():
+    port = pick_port() or "COM4"
+    baud = 115200
+
+    with serial.Serial(port, baudrate=baud, timeout=0.05) as ser:
+        time.sleep(0.2)
+        link = Link(ser)
+
+        while True:
+            cmd = input("Enter command (BLUE/RED/GREEN/UNKNOW/quit): ").strip()
+            if cmd.lower() == "quit":
+                break
+            send_command(link, cmd)
+
+if __name__ == "__main__":
+    main()
+

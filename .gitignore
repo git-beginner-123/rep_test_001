@@ -1,0 +1,17 @@
+
+# Build outputs
+*.o
+*.a
+*.elf
+*.bin
+*.hex
+*.map
+
+# Build folders
+build/
+out/
+
+# IDE
+.vscode/
+.idea/
+

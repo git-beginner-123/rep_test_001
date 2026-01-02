@@ -1,0 +1,29 @@
+
+What does each line do?
+
+
+#include <stdio.h>   // Standard input/output library, provides printf()
+
+int main(void)       // Program entry point, returns an int value
+
+printf("Hello, world!\n");  // Prints a string to standard output
+
+return 0;            // Terminates the program successfully
+
+
+ How to compile and run it on Linux
+1 save the file
+hello.c
+
+2️⃣ Compile
+gcc hello.c -o hello
+
+3️⃣ Run
+./hello
+
+
+Output:
+
+Hello, world! 
+
+

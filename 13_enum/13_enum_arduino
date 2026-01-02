@@ -1,0 +1,259 @@
+
+
+#include <Arduino.h>
+#include <Adafruit_NeoPixel.h>
+
+/* ================== NeoPixel config ================== */
+static const int NEOPIXEL_PIN = 48;   // change if your board differs
+static const int NEOPIXEL_COUNT = 1;
+
+static Adafruit_NeoPixel g_pixels(
+    NEOPIXEL_COUNT,
+    NEOPIXEL_PIN,
+    NEO_GRB + NEO_KHZ800
+);
+
+/* ================== Protocol constants ================== */
+static const uint8_t SOF = 0xAA;
+static const uint8_t EOF_MARK = 0x55;
+
+/* ================== ENUM definitions ================== */
+typedef enum {
+    FLAG_ACK_REQ = 1 << 0,
+    FLAG_IS_ACK  = 1 << 1,
+    FLAG_IS_NACK = 1 << 2,
+    FLAG_HAS_TLV = 1 << 3
+} FrameFlags;
+
+typedef enum {
+    TYPE_CMD = 0x01,
+    TYPE_RSP = 0x02
+} FrameType;
+
+typedef enum {
+    TAG_TEXT  = 0x02,
+    TAG_ERROR = 0x7F
+} TlvTag;
+
+/* í ½í´´í ½í´´í ½í´´ å…³é”®ä¿®å¤ç‚¹ï¼šLedColor å¿…é¡»åœ¨ä½¿ç”¨å‰å£°æ˜Ž í ½í´´í ½í´´í ½í´´ */
+typedef enum {
+    COLOR_RED,
+    COLOR_GREEN,
+    COLOR_BLUE
+} LedColor;
+
+/* ================== Parser state ================== */
+enum ParserState : uint8_t {
+    ST_WAIT_SOF = 0,
+    ST_READ_FLAGS,
+    ST_READ_TYPE,
+    ST_READ_SEQ,
+    ST_READ_LEN,
+    ST_READ_PAYLOAD,
+    ST_READ_CRC,
+    ST_READ_EOF
+};
+
+struct Frame {
+    uint8_t flags;
+    uint8_t type;
+    uint8_t seq;
+    uint8_t len;
+    uint8_t payload[96];
+    uint8_t crc;
+};
+
+/* ================== Globals ================== */
+static ParserState g_state = ST_WAIT_SOF;
+static Frame g_rx;
+static uint8_t g_index = 0;
+
+static bool g_hasLastRsp = false;
+static uint8_t g_lastSeq = 0;
+static uint8_t g_lastRsp[160];
+static size_t g_lastRspLen = 0;
+
+/* ================== CRC ================== */
+static uint8_t crc8_xor(const uint8_t *data, size_t n) {
+    uint8_t c = 0;
+    for (size_t i = 0; i < n; ++i) c ^= data[i];
+    return c;
+}
+
+static uint8_t compute_crc(const Frame &f) {
+    uint8_t buf[4 + 96];
+    buf[0] = f.flags;
+    buf[1] = f.type;
+    buf[2] = f.seq;
+    buf[3] = f.len;
+    for (uint8_t i = 0; i < f.len; ++i) buf[4 + i] = f.payload[i];
+    return crc8_xor(buf, 4 + f.len);
+}
+
+/* ================== LED control ================== */
+static void led_set_color(LedColor c) {
+    uint8_t r = 0, g = 0, b = 0;
+
+    if (c == COLOR_RED)   r = 255;
+    if (c == COLOR_GREEN) g = 255;
+    if (c == COLOR_BLUE)  b = 255;
+
+    g_pixels.setPixelColor(0, g_pixels.Color(r, g, b));
+    g_pixels.show();
+}
+
+/* ================== Send helpers ================== */
+static void send_raw(const uint8_t *data, size_t len) {
+    Serial.write(data, len);
+    Serial.flush();
+}
+
+static void cache_last_response(const uint8_t *data, size_t len, uint8_t seq) {
+    g_hasLastRsp = true;
+    g_lastSeq = seq;
+    g_lastRspLen = len;
+    memcpy(g_lastRsp, data, len);
+}
+
+static void send_frame(uint8_t flags, uint8_t type, uint8_t seq,
+                       const uint8_t *payload, uint8_t len) {
+    uint8_t out[160];
+    size_t p = 0;
+
+    out[p++] = SOF;
+    out[p++] = flags;
+    out[p++] = type;
+    out[p++] = seq;
+    out[p++] = len;
+
+    for (uint8_t i = 0; i < len; ++i) out[p++] = payload[i];
+
+    Frame tmp;
+    tmp.flags = flags;
+    tmp.type  = type;
+    tmp.seq   = seq;
+    tmp.len   = len;
+    memcpy(tmp.payload, payload, len);
+
+    out[p++] = compute_crc(tmp);
+    out[p++] = EOF_MARK;
+
+    send_raw(out, p);
+    cache_last_response(out, p, seq);
+}
+
+/* ================== TLV helpers ================== */
+static uint8_t tlv_bytes(uint8_t *out, uint8_t tag, const uint8_t *data, uint8_t n) {
+    out[0] = tag;
+    out[1] = n;
+    memcpy(&out[2], data, n);
+    return 2 + n;
+}
+
+static void send_text_rsp(uint8_t seq, const char *msg) {
+    uint8_t tlv[64];
+    uint8_t n = strlen(msg);
+    uint8_t ln = tlv_bytes(tlv, TAG_TEXT, (const uint8_t*)msg, n);
+    send_frame(FLAG_HAS_TLV, TYPE_RSP, seq, tlv, ln);
+}
+
+/* ================== Command handling ================== */
+static bool equals_token(const uint8_t *buf, uint8_t len, const char *token) {
+    size_t tlen = strlen(token);
+    if (len != tlen) return false;
+    for (uint8_t i = 0; i < len; ++i) {
+        if ((char)buf[i] != token[i]) return false;
+    }
+    return true;
+}
+
+static void handle_tlv_cmd(uint8_t seq, const uint8_t *payload, uint8_t len) {
+    if (len < 2 || payload[0] != TAG_TEXT) {
+        send_text_rsp(seq, "NOT_SUPPORTED");
+        return;
+    }
+
+    uint8_t tl = payload[1];
+    const uint8_t *cmd = &payload[2];
+
+    if (equals_token(cmd, tl, "BLUE")) {
+        led_set_color(COLOR_BLUE);
+        send_text_rsp(seq, "OK");
+    } else if (equals_token(cmd, tl, "RED")) {
+        led_set_color(COLOR_RED);
+        send_text_rsp(seq, "OK");
+    } else if (equals_token(cmd, tl, "GREEN")) {
+        led_set_color(COLOR_GREEN);
+        send_text_rsp(seq, "OK");
+    } else {
+        send_text_rsp(seq, "NOT_SUPPORTED");
+    }
+}
+
+/* ================== Parser ================== */
+static void reset_parser() {
+    g_state = ST_WAIT_SOF;
+    g_index = 0;
+}
+
+static void on_frame(const Frame &f) {
+    if (g_hasLastRsp && f.seq == g_lastSeq) {
+        send_raw(g_lastRsp, g_lastRspLen);
+        return;
+    }
+
+    if (f.type == TYPE_CMD && (f.flags & FLAG_HAS_TLV)) {
+        handle_tlv_cmd(f.seq, f.payload, f.len);
+    }
+}
+
+static void feed_parser(uint8_t b) {
+    switch (g_state) {
+        case ST_WAIT_SOF:
+            if (b == SOF) g_state = ST_READ_FLAGS;
+            break;
+        case ST_READ_FLAGS:
+            g_rx.flags = b; g_state = ST_READ_TYPE; break;
+        case ST_READ_TYPE:
+            g_rx.type = b; g_state = ST_READ_SEQ; break;
+        case ST_READ_SEQ:
+            g_rx.seq = b; g_state = ST_READ_LEN; break;
+        case ST_READ_LEN:
+            g_rx.len = b; g_index = 0;
+            g_state = (b == 0) ? ST_READ_CRC : ST_READ_PAYLOAD;
+            break;
+        case ST_READ_PAYLOAD:
+            g_rx.payload[g_index++] = b;
+            if (g_index >= g_rx.len) g_state = ST_READ_CRC;
+            break;
+        case ST_READ_CRC:
+            g_rx.crc = b; g_state = ST_READ_EOF; break;
+        case ST_READ_EOF:
+            if (b == EOF_MARK && compute_crc(g_rx) == g_rx.crc) {
+                on_frame(g_rx);
+            }
+            reset_parser();
+            break;
+    }
+}
+
+/* ================== Arduino entry ================== */
+void setup() {
+    Serial.begin(115200);
+    delay(200);
+
+    g_pixels.begin();
+    g_pixels.clear();
+    g_pixels.show();
+
+    led_set_color(COLOR_BLUE); // default
+
+    reset_parser();
+}
+
+void loop() {
+    while (Serial.available()) {
+        feed_parser((uint8_t)Serial.read());
+    }
+}
+

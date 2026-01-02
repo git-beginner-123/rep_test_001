@@ -1,0 +1,22 @@
+
+void setup() {
+  // Set PB2 (D10) and PB4 (D12) as output
+  DDRB |= (1 << 2) | (1 << 4);
+}
+
+void loop() {
+  // 1. GPIO10, GPIO12 output LOW
+  PORTB &= ~((1 << 2) | (1 << 4));
+  delay(100);
+
+  // 3. GPIO10 output HIGH
+  PORTB |= (1 << 2);
+  delay(100);
+
+  // 4. GPIO12 output HIGH
+  PORTB |= (1 << 4);
+  delay(100);
+
+  // loop back to step 1
+}
+

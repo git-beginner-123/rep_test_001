@@ -1,0 +1,72 @@
+
+
+#include <Adafruit_NeoPixel.h>
+
+// One-wire RGB LED (WS2812/NeoPixel-like)
+const uint8_t PIN_DATA  = 48;   // one-wire data pin
+const uint8_t PIN_EXTRA = 47;   // change to any free GPIO you have
+const uint16_t LED_COUNT = 1;   // 1 RGB LED; change if you have a strip
+
+Adafruit_NeoPixel strip(LED_COUNT, PIN_DATA, NEO_GRB + NEO_KHZ800);
+
+struct Phase {
+  uint32_t color;       // packed RGB color
+  uint32_t durationMs;
+  uint8_t extraHigh;    // extra pin level in this phase
+};
+
+// Helper to build packed color
+static uint32_t rgb(uint8_t r, uint8_t g, uint8_t b) {
+  return strip.Color(r, g, b);
+}
+
+// Red 2s -> Green 3s -> Yellow 4s
+const Phase phases[] = {
+  {0, 2000, 1}, // placeholder color, will set in setup after strip.begin()
+  {0, 3000, 0},
+  {0, 4000, 0}
+};
+
+const uint8_t PHASE_COUNT = sizeof(phases) / sizeof(phases[0]);
+uint8_t phaseIndex = 0;
+uint32_t phaseStartMs = 0;
+
+// We will copy phases into a writable array to fill colors after strip.begin()
+Phase phaseTable[PHASE_COUNT];
+
+static void applyPhase(const Phase& p) {
+  for (uint16_t i = 0; i < LED_COUNT; i++) {
+    strip.setPixelColor(i, p.color);
+  }
+  strip.show();
+  digitalWrite(PIN_EXTRA, p.extraHigh ? HIGH : LOW);
+}
+
+void setup() {
+  pinMode(PIN_EXTRA, OUTPUT);
+  digitalWrite(PIN_EXTRA, LOW);
+
+  strip.begin();
+  strip.show(); // clear
+
+  // Build phase table with actual colors (requires strip.begin first)
+  phaseTable[0] = { rgb(255, 0, 0),   2000, 1 }; // RED, extra HIGH
+  phaseTable[1] = { rgb(0, 255, 0),   3000, 0 }; // GREEN
+  phaseTable[2] = { rgb(255, 160, 0), 4000, 0 }; // YELLOW (tunable)
+
+  phaseStartMs = millis();
+  applyPhase(phaseTable[phaseIndex]);
+}
+
+void loop() {
+  uint32_t nowMs = millis();
+  if (nowMs - phaseStartMs >= phaseTable[phaseIndex].durationMs) {
+    phaseIndex++;
+    if (phaseIndex >= PHASE_COUNT) phaseIndex = 0;
+    phaseStartMs = nowMs;
+    applyPhase(phaseTable[phaseIndex]);
+  }
+
+  // Add other non-blocking tasks here if needed
+}
+
